@@ -1,7 +1,6 @@
 import logging
 import os
-import json
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 import pytz
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -22,19 +21,33 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # Conversation states
-CHOOSE_TRACK, CHOOSE_TIME, DO_TASK = range(3)
+CHOOSE_TRACK, CHOOSE_TIMEZONE, CHOOSE_TIME = range(3)
 
 TRACKS = {
     "💼 Business English": "business",
     "🗣 Conversational English": "conversational"
 }
 
-# ─── HELPERS ────────────────────────────────────────────────
+TIMEZONES = {
+    "🇧🇷 Brazil (UTC-3)": "America/Sao_Paulo",
+    "🇬🇧 UK (UTC+0)": "Europe/London",
+    "🇪🇺 Europe (UTC+1)": "Europe/Berlin",
+    "🇷🇺 Moscow (UTC+3)": "Europe/Moscow",
+    "🇰🇿 Kazakhstan (UTC+5)": "Asia/Almaty",
+    "🇺🇸 US East (UTC-5)": "America/New_York",
+    "🇺🇸 US West (UTC-8)": "America/Los_Angeles",
+}
+
+TIMES = ["07:00", "08:00", "09:00", "10:00", "12:00",
+         "15:00", "18:00", "19:00", "20:00", "21:00", "22:00"]
+
+# ─── SUPABASE HELPERS ────────────────────────────────────────
 
 def get_user(telegram_id: int):
     res = supabase.table("users").select("*").eq("telegram_id", telegram_id).execute()
@@ -47,31 +60,24 @@ def upsert_user(telegram_id: int, data: dict):
     else:
         supabase.table("users").insert({"telegram_id": telegram_id, **data}).execute()
 
-def get_todays_task(track: str):
+def get_task_for_today(track: str, skill: str):
     today = datetime.now(pytz.utc).strftime("%Y-%m-%d")
-    res = supabase.table("tasks").select("*").eq("track", track).eq("scheduled_date", today).execute()
+    res = supabase.table("tasks").select("*")\
+        .eq("track", track)\
+        .eq("skill", skill)\
+        .eq("scheduled_date", today)\
+        .execute()
     return res.data[0] if res.data else None
 
-def get_ai_feedback(task_content: str, user_answer: str, skill: str) -> str:
-    prompt = f"""You are a friendly and encouraging English teacher giving feedback to a student.
+def get_task_by_id(task_id: int):
+    res = supabase.table("tasks").select("*").eq("id", task_id).execute()
+    return res.data[0] if res.data else None
 
-Task type: {skill}
-Task: {task_content}
-Student's answer: {user_answer}
+def set_active_task(telegram_id: int, task_id: int):
+    upsert_user(telegram_id, {"current_task_id": task_id})
 
-Give concise feedback (3-5 sentences max):
-1. Start with one thing they did well
-2. Point out 1-2 specific improvements with examples
-3. End with encouragement
-
-Be warm, specific, and practical. Write in English."""
-
-    message = anthropic_client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return message.content[0].text
+def clear_active_task(telegram_id: int):
+    upsert_user(telegram_id, {"current_task_id": None})
 
 def calculate_xp(streak: int) -> int:
     base = 10
@@ -89,9 +95,15 @@ def update_streak_and_xp(telegram_id: int):
     last = user.get("last_task_date")
 
     if last:
-        last_date = datetime.fromisoformat(last).date() if isinstance(last, str) else last
+        last_date = datetime.fromisoformat(str(last)).date()
         diff = (today - last_date).days
-        new_streak = user["streak"] + 1 if diff == 1 else (user["streak"] if diff == 0 else 1)
+        if diff == 0:
+            # Already completed a task today, still give XP but don't change streak
+            new_streak = user["streak"]
+        elif diff == 1:
+            new_streak = user["streak"] + 1
+        else:
+            new_streak = 1
     else:
         new_streak = 1
 
@@ -105,22 +117,80 @@ def update_streak_and_xp(telegram_id: int):
     })
     return new_streak, xp_gained, new_xp
 
-# ─── HANDLERS ───────────────────────────────────────────────
+# ─── AI FEEDBACK ─────────────────────────────────────────────
+
+def get_ai_feedback(task_content: str, user_answer: str, skill: str) -> str:
+    prompt = f"""You are a warm, encouraging English teacher giving feedback to a B1-B2 student.
+
+Task type: {skill}
+Task: {task_content}
+Student's answer: {user_answer}
+
+Give feedback using EXACTLY this format — each point on its own line, never merged into one paragraph:
+
+✅ [One specific thing they did well — be concrete, not generic]
+
+💡 [One clear improvement with a corrected example in quotes]
+
+💪 [One short encouraging closing sentence]
+
+Rules:
+- Keep each point to 1-2 sentences max
+- Never start with "Great job!" or "Well done!"
+- Always include a real corrected example in the 💡 point"""
+
+    message = anthropic_client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=300,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return message.content[0].text
+
+# ─── TASK DELIVERY ───────────────────────────────────────────
+
+async def send_task(chat_id: int, track: str, skill: str, context: ContextTypes.DEFAULT_TYPE, is_second=False):
+    task = get_task_for_today(track, skill)
+
+    if not task:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⏳ Today's task isn't ready yet. The admin will generate tasks soon — try again in a bit!"
+        )
+        return
+
+    set_active_task(chat_id, task["id"])
+
+    skill_emoji = "✍️" if skill == "writing" else "🗣"
+    intro = "And here's your second task for today! 💪" if is_second else "Here's your task for today!"
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"{intro}\n\n"
+             f"{skill_emoji} *{skill.capitalize()} Task*\n\n"
+             f"{task['content']}\n\n"
+             f"_Reply with your answer below 👇_",
+        parse_mode="Markdown"
+    )
+
+# ─── ONBOARDING ──────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
 
     if user and user.get("track"):
         await update.message.reply_text(
-            f"👋 Welcome back! Use /task to get today's task or /stats to see your progress."
+            "👋 Welcome back! Use /task to get today's tasks or /stats to see your progress."
         )
         return ConversationHandler.END
 
     keyboard = [[track] for track in TRACKS.keys()]
     await update.message.reply_text(
         "👋 *Welcome to DailyEnglish Bot!*\n\n"
-        "Practice English just 5–10 minutes a day and feel real progress every week.\n\n"
-        "First, choose your learning track:",
+        "Practice English just *10 minutes a day* and feel real progress every week.\n\n"
+        "Every day you'll get *2 tasks* — one writing, one speaking. "
+        "Answer them, get instant AI feedback, earn XP and build your streak.\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        "*Step 1 of 3:* Choose your learning track 👇",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     )
@@ -129,158 +199,228 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def choose_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chosen = update.message.text
     if chosen not in TRACKS:
-        await update.message.reply_text("Please choose one of the options below.")
+        await update.message.reply_text("Please choose one of the options below 👇")
         return CHOOSE_TRACK
 
     context.user_data["track"] = TRACKS[chosen]
 
+    keyboard = [[tz] for tz in TIMEZONES.keys()]
     await update.message.reply_text(
-        f"Great choice! ✅\n\n"
-        f"Now, what time should I send you your daily task?\n\n"
-        f"Send me the time in *HH:MM* format (24h), for example: `09:00` or `20:30`\n\n"
-        f"_All times are in UTC. Brazil (Brasília) = UTC-3, so 9am local = 12:00 UTC_",
+        f"✅ *{chosen}* — great choice!\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        "*Step 2 of 3:* Where are you located? 🌍",
         parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    )
+    return CHOOSE_TIMEZONE
+
+async def choose_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chosen = update.message.text
+    if chosen not in TIMEZONES:
+        await update.message.reply_text("Please choose one of the options below 👇")
+        return CHOOSE_TIMEZONE
+
+    context.user_data["timezone"] = TIMEZONES[chosen]
+
+    # Build time keyboard (2 per row)
+    time_buttons = [TIMES[i:i+2] for i in range(0, len(TIMES), 2)]
+    await update.message.reply_text(
+        "✅ Got it!\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        "*Step 3 of 3:* What time should I send your daily tasks? ⏰\n\n"
+        "_Pick a time when you know you'll have 10 free minutes and a clear head._",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(time_buttons, one_time_keyboard=True, resize_keyboard=True)
     )
     return CHOOSE_TIME
 
 async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    try:
-        hour, minute = map(int, text.split(":"))
-        assert 0 <= hour <= 23 and 0 <= minute <= 59
-    except:
-        await update.message.reply_text("❌ Invalid format. Please send time like `09:00`", parse_mode="Markdown")
+    chosen = update.message.text.strip()
+    if chosen not in TIMES:
+        await update.message.reply_text("Please choose one of the time options below 👇")
         return CHOOSE_TIME
 
     telegram_id = update.effective_user.id
     track = context.user_data["track"]
+    timezone_str = context.user_data["timezone"]
+
+    # Convert local time to UTC for scheduling
+    tz = pytz.timezone(timezone_str)
+    hour, minute = map(int, chosen.split(":"))
+    local_time = datetime.now(tz).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    utc_time = local_time.astimezone(pytz.utc)
 
     upsert_user(telegram_id, {
         "telegram_id": telegram_id,
         "track": track,
-        "notification_time": text,
+        "timezone": timezone_str,
+        "notification_time": chosen,
+        "notification_utc": f"{utc_time.hour:02d}:{utc_time.minute:02d}",
         "xp": 0,
         "streak": 0,
-        "last_task_date": None
+        "last_task_date": None,
+        "current_task_id": None,
+        "tasks_completed_today": 0
     })
 
     # Schedule daily notification
     context.job_queue.run_daily(
-        send_daily_task,
-        time=time(hour=hour, minute=minute, tzinfo=pytz.utc),
+        send_daily_tasks,
+        time=time(hour=utc_time.hour, minute=utc_time.minute, tzinfo=pytz.utc),
         chat_id=telegram_id,
         name=str(telegram_id)
     )
 
+    track_name = "Business English" if track == "business" else "Conversational English"
+
     await update.message.reply_text(
-        f"✅ All set!\n\n"
-        f"Track: *{'Business English' if track == 'business' else 'Conversational English'}*\n"
-        f"Daily reminder: *{text} UTC*\n\n"
-        f"I'll send you a task every day. Use /task anytime to get today's task right now!",
-        parse_mode="Markdown"
+        f"🎉 *You're all set!*\n\n"
+        f"📚 Track: *{track_name}*\n"
+        f"⏰ Daily tasks at: *{chosen}* your time\n\n"
+        f"Let's start right now — here's your first task! 👇",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
     )
+
+    # Send first task immediately
+    await send_task(telegram_id, track, "writing", context)
     return ConversationHandler.END
 
-async def send_daily_task(context: ContextTypes.DEFAULT_TYPE):
+# ─── DAILY PUSH ──────────────────────────────────────────────
+
+async def send_daily_tasks(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
     user = get_user(chat_id)
     if not user:
         return
 
-    task = get_todays_task(user["track"])
-    if not task:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="⏳ Today's task is being prepared. Check back in a few minutes!"
+    # Reset daily counter
+    upsert_user(chat_id, {"tasks_completed_today": 0, "current_task_id": None})
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="🌅 *Good morning! Your daily English practice is ready.*\n\n"
+             "2 tasks today — writing + speaking. Takes about 10 minutes. Let's go! 💪",
+        parse_mode="Markdown"
+    )
+    await send_task(chat_id, user["track"], "writing", context)
+
+# ─── ANSWER HANDLER ──────────────────────────────────────────
+
+async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    telegram_id = update.effective_user.id
+    user = get_user(telegram_id)
+
+    # Not registered yet
+    if not user or not user.get("track"):
+        await update.message.reply_text(
+            "👋 Looks like you haven't started yet! Send /start to set up your account."
         )
         return
 
-    context.user_data[chat_id] = {"current_task": task}
+    # Voice message
+    if update.message.voice:
+        await update.message.reply_text(
+            "🎙 Voice answers are coming soon! Please send a text answer for now."
+        )
+        return
 
-    skill_emoji = "✍️" if task["skill"] == "writing" else "🗣"
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"🌅 *Good morning! Time for your daily English practice.*\n\n"
-             f"{skill_emoji} *{task['skill'].capitalize()} Task*\n\n"
-             f"{task['content']}\n\n"
-             f"_Reply with your answer (text or voice message)_",
+    # No active task
+    task_id = user.get("current_task_id")
+    if not task_id:
+        completed = user.get("tasks_completed_today", 0)
+        if completed >= 2:
+            await update.message.reply_text(
+                "✅ You've already completed both tasks for today! Come back tomorrow.\n\n"
+                "Check your progress with /stats 📊"
+            )
+        else:
+            await update.message.reply_text(
+                "Use /task to get your daily tasks! 📚"
+            )
+        return
+
+    task = get_task_by_id(task_id)
+    if not task:
+        await update.message.reply_text("Something went wrong. Use /task to try again.")
+        return
+
+    user_answer = update.message.text
+    await update.message.reply_text("⏳ Reviewing your answer...")
+
+    try:
+        feedback = get_ai_feedback(task["content"], user_answer, task["skill"])
+    except Exception as e:
+        logger.error(f"AI feedback error: {e}")
+        feedback = "Good effort! Keep practicing — consistency is what builds real progress."
+
+    # Update streak and XP
+    new_streak, xp_gained, total_xp = update_streak_and_xp(telegram_id)
+
+    # Save answer
+    supabase.table("answers").insert({
+        "telegram_id": telegram_id,
+        "task_id": task_id,
+        "answer": user_answer,
+        "feedback": feedback,
+        "created_at": datetime.now(pytz.utc).isoformat()
+    }).execute()
+
+    # Clear active task and update completed count
+    completed_today = (user.get("tasks_completed_today") or 0) + 1
+    upsert_user(telegram_id, {
+        "current_task_id": None,
+        "tasks_completed_today": completed_today
+    })
+
+    # Send feedback
+    await update.message.reply_text(
+        f"📝 *Feedback:*\n\n{feedback}",
         parse_mode="Markdown"
     )
+
+    # Send congratulation separately
+    streak_emoji = "🔥" if new_streak > 1 else "✅"
+    bonus_note = f" _(+{xp_gained - 10} streak bonus!)_" if xp_gained > 10 else ""
+
+    await update.message.reply_text(
+        f"{streak_emoji} *Task complete!*\n\n"
+        f"⭐ +{xp_gained} XP{bonus_note}\n"
+        f"📈 Total: {total_xp} XP\n"
+        f"🔥 Streak: {new_streak} {'day' if new_streak == 1 else 'days'}",
+        parse_mode="Markdown"
+    )
+
+    # Send second task if first is done
+    if completed_today == 1:
+        await update.message.reply_text("Now let's do the speaking task! 🗣")
+        await send_task(telegram_id, user["track"], "speaking", context, is_second=True)
+
+# ─── COMMANDS ────────────────────────────────────────────────
 
 async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     user = get_user(telegram_id)
 
     if not user or not user.get("track"):
-        await update.message.reply_text("Please start first with /start")
+        await update.message.reply_text("Please start with /start first!")
         return
 
-    task = get_todays_task(user["track"])
-    if not task:
+    completed = user.get("tasks_completed_today", 0)
+
+    if completed >= 2:
         await update.message.reply_text(
-            "⏳ No task available for today yet. Tasks are generated every Sunday for the week ahead.\n\n"
-            "Use /generate to create this week's tasks (admin only)."
+            "✅ You've completed both tasks for today! Great job.\n\n"
+            "Come back tomorrow or check /stats 📊"
         )
         return
 
-    context.user_data["current_task"] = task
-    skill_emoji = "✍️" if task["skill"] == "writing" else "🗣"
-
-    await update.message.reply_text(
-        f"{skill_emoji} *{task['skill'].capitalize()} Task*\n\n"
-        f"{task['content']}\n\n"
-        f"_Reply with your answer (text or voice message)_",
-        parse_mode="Markdown"
-    )
-
-async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_id = update.effective_user.id
-    task = context.user_data.get("current_task")
-
-    if not task:
-        await update.message.reply_text(
-            "Use /task to get today's task first!"
-        )
-        return
-
-    # Handle voice message
-    if update.message.voice:
-        await update.message.reply_text("🎙 Voice messages coming soon! Please send a text answer for now.")
-        return
-
-    user_answer = update.message.text
-    await update.message.reply_text("⏳ Analyzing your answer...")
-
-    try:
-        feedback = get_ai_feedback(task["content"], user_answer, task["skill"])
-    except Exception as e:
-        logger.error(f"AI feedback error: {e}")
-        feedback = "Great effort! Keep practicing every day."
-
-    new_streak, xp_gained, total_xp = update_streak_and_xp(telegram_id)
-
-    # Save answer
-    supabase.table("answers").insert({
-        "telegram_id": telegram_id,
-        "task_id": task["id"],
-        "answer": user_answer,
-        "feedback": feedback,
-        "created_at": datetime.now(pytz.utc).isoformat()
-    }).execute()
-
-    streak_msg = f"🔥 {new_streak} day streak!" if new_streak > 1 else "✅ Task complete!"
-    bonus_msg = f" (+{xp_gained - 10} bonus)" if xp_gained > 10 else ""
-
-    await update.message.reply_text(
-        f"📝 *Feedback:*\n\n{feedback}\n\n"
-        f"───────────────\n"
-        f"{streak_msg}\n"
-        f"⭐ +{xp_gained} XP{bonus_msg} → Total: {total_xp} XP",
-        parse_mode="Markdown"
-    )
-
-    context.user_data.pop("current_task", None)
+    if completed == 0:
+        upsert_user(telegram_id, {"current_task_id": None})
+        await send_task(telegram_id, user["track"], "writing", context)
+    else:
+        upsert_user(telegram_id, {"current_task_id": None})
+        await send_task(telegram_id, user["track"], "speaking", context, is_second=True)
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
@@ -291,76 +431,101 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_name = "Business English" if user.get("track") == "business" else "Conversational English"
     streak = user.get("streak", 0)
     xp = user.get("xp", 0)
+    completed_today = user.get("tasks_completed_today", 0)
 
-    streak_emoji = "🔥" if streak > 0 else "💤"
-    level = "Beginner" if xp < 100 else "Intermediate" if xp < 500 else "Advanced" if xp < 1500 else "Expert"
+    if xp < 100:
+        level, next_level = "🌱 Beginner", 100
+    elif xp < 500:
+        level, next_level = "📗 Elementary", 500
+    elif xp < 1500:
+        level, next_level = "📘 Intermediate", 1500
+    else:
+        level, next_level = "📙 Advanced", None
+
+    progress = f"{xp}/{next_level} XP to next level" if next_level else "Max level reached! 🏆"
+    streak_emoji = "🔥" if streak >= 3 else "✅" if streak > 0 else "💤"
 
     await update.message.reply_text(
         f"📊 *Your Progress*\n\n"
         f"🎯 Track: {track_name}\n"
-        f"{streak_emoji} Current streak: {streak} days\n"
-        f"⭐ Total XP: {xp}\n"
-        f"🏆 Level: {level}\n\n"
-        f"{'Keep going! 💪' if streak > 0 else 'Start your streak today with /task!'}",
+        f"{streak_emoji} Streak: {streak} {'day' if streak == 1 else 'days'}\n"
+        f"⭐ XP: {xp}\n"
+        f"🏆 Level: {level}\n"
+        f"📈 {progress}\n\n"
+        f"Today: {'✅✅ Both tasks done!' if completed_today >= 2 else '✅⬜ 1/2 done' if completed_today == 1 else '⬜⬜ No tasks yet'}",
         parse_mode="Markdown"
     )
 
 async def generate_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to generate tasks for the week"""
-    await update.message.reply_text("⏳ Generating tasks for this week...")
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ This command is for admins only.")
+        return
+
+    await update.message.reply_text("⏳ Generating tasks for the next 7 days...")
 
     tracks = ["business", "conversational"]
-    skills = ["writing", "speaking", "writing", "speaking", "writing", "speaking", "writing"]
-
-    from datetime import timedelta
+    skills = ["writing", "speaking"]
     today = datetime.now(pytz.utc).date()
 
     generated = 0
-    for track in tracks:
-        for day_offset, skill in enumerate(skills):
-            task_date = today + timedelta(days=day_offset)
+    for day_offset in range(7):
+        task_date = today + timedelta(days=day_offset)
+        for track in tracks:
+            for skill in skills:
+                existing = supabase.table("tasks").select("id")\
+                    .eq("track", track)\
+                    .eq("skill", skill)\
+                    .eq("scheduled_date", task_date.isoformat())\
+                    .execute()
+                if existing.data:
+                    continue
 
-            # Check if task already exists
-            existing = supabase.table("tasks").select("id")\
-                .eq("track", track).eq("scheduled_date", task_date.isoformat()).execute()
-            if existing.data:
-                continue
-
-            prompt = f"""Generate a {skill} task for an English learner (B1-B2 level).
+                prompt = f"""Generate a {skill} task for an English learner (B1-B2 level).
 Track: {track} English
 Skill: {skill}
 
-For writing tasks: give a realistic professional/conversational scenario and ask them to write 2-4 sentences.
-For speaking tasks: give a dialogue prompt or question to respond to in 2-4 sentences.
+{'For writing: give a realistic scenario and ask them to write 3-5 sentences (email, report snippet, message, feedback).' if skill == 'writing' else 'For speaking: give a dialogue scenario or open question to respond to in 3-5 sentences.'}
 
-Format: Just the task text itself, no labels or headers. Be specific and practical.
-Keep it under 100 words."""
+Format the task EXACTLY like this — two parts separated by a blank line:
 
-            try:
-                message = anthropic_client.messages.create(
-                    model="claude-haiku-4-5-20251001",
-                    max_tokens=200,
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                task_content = message.content[0].text
+[One sentence describing the scenario or context]
 
-                supabase.table("tasks").insert({
-                    "track": track,
-                    "skill": skill,
-                    "scheduled_date": task_date.isoformat(),
-                    "content": task_content
-                }).execute()
-                generated += 1
-            except Exception as e:
-                logger.error(f"Task generation error: {e}")
+[Clear instruction telling them what to write or say]
 
-    await update.message.reply_text(f"✅ Generated {generated} tasks for the week!")
+Rules:
+- Each part on its own line with a blank line between them
+- Keep it practical and relevant to real work or daily life
+- No labels, headers, or meta-commentary
+- Total length: under 60 words"""
+
+                try:
+                    message = anthropic_client.messages.create(
+                        model="claude-haiku-4-5-20251001",
+                        max_tokens=200,
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    task_content = message.content[0].text.strip()
+
+                    supabase.table("tasks").insert({
+                        "track": track,
+                        "skill": skill,
+                        "scheduled_date": task_date.isoformat(),
+                        "content": task_content
+                    }).execute()
+                    generated += 1
+                except Exception as e:
+                    logger.error(f"Task generation error: {e}")
+
+    await update.message.reply_text(
+        f"✅ Done! Generated {generated} tasks for the next 7 days.\n\n"
+        f"Check them in Supabase → tasks table."
+    )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-# ─── MAIN ───────────────────────────────────────────────────
+# ─── MAIN ────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -369,6 +534,7 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             CHOOSE_TRACK: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_track)],
+            CHOOSE_TIMEZONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_timezone)],
             CHOOSE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_time)],
         },
         fallbacks=[CommandHandler("cancel", cancel)]
@@ -386,4 +552,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF

@@ -9,6 +9,8 @@ from telegram.ext import (
 )
 from supabase import create_client
 import anthropic
+import openai
+import tempfile
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -21,10 +23,12 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # Conversation states
 CHOOSE_TRACK, CHOOSE_TIMEZONE, CHOOSE_TIME = range(3)
@@ -117,10 +121,43 @@ def update_streak_and_xp(telegram_id: int):
     })
     return new_streak, xp_gained, new_xp
 
+# ─── VOICE TRANSCRIPTION ─────────────────────────────────────
+
+async def transcribe_voice(file_path: str) -> str:
+    with open(file_path, "rb") as audio_file:
+        transcript = openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            language="en"
+        )
+    return transcript.text
+
 # ─── AI FEEDBACK ─────────────────────────────────────────────
 
-def get_ai_feedback(task_content: str, user_answer: str, skill: str) -> str:
-    prompt = f"""You are a warm, encouraging English teacher giving feedback to a B1-B2 student.
+def get_ai_feedback(task_content: str, user_answer: str, skill: str, is_transcribed: bool = False) -> str:
+    if skill == "speaking":
+        prompt = f"""You are a warm, encouraging English teacher giving feedback on a speaking exercise.
+The student recorded a voice message which was transcribed to text.
+
+Task: {task_content}
+Transcribed answer: {user_answer}
+
+Give feedback using EXACTLY this format — each point on its own line:
+
+✅ [One specific thing they said well — content or language]
+
+💡 [One grammar or vocabulary improvement with a corrected example in quotes]
+
+🗣 [One tip specifically for speaking — pronunciation, fluency, or natural phrasing]
+
+💪 [One short encouraging closing sentence]
+
+Rules:
+- Keep each point to 1-2 sentences max
+- Be concrete and specific, never generic
+- Always include a real corrected example in the 💡 point"""
+    else:
+        prompt = f"""You are a warm, encouraging English teacher giving feedback to a B1-B2 student.
 
 Task type: {skill}
 Task: {task_content}
@@ -141,7 +178,7 @@ Rules:
 
     message = anthropic_client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=300,
+        max_tokens=350,
         messages=[{"role": "user", "content": prompt}]
     )
     return message.content[0].text
@@ -318,15 +355,45 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Voice message
+    # No active task check for voice
+    task_id = user.get("current_task_id")
+
+    # Voice message — transcribe with Whisper
+    is_transcribed = False
     if update.message.voice:
-        await update.message.reply_text(
-            "🎙 Voice answers are coming soon! Please send a text answer for now."
-        )
-        return
+        if not task_id:
+            await update.message.reply_text(
+                "🎙 Use /task to get your speaking task first, then send a voice message!"
+            )
+            return
+        task = get_task_by_id(task_id)
+        if not task or task["skill"] != "speaking":
+            await update.message.reply_text(
+                "🎙 Voice messages are only for speaking tasks.\n\nFinish the writing task first, then you'll get the speaking task!"
+            )
+            return
+        await update.message.reply_text("🎙 Transcribing your voice message...")
+        try:
+            voice_file = await update.message.voice.get_file()
+            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                await voice_file.download_to_drive(tmp.name)
+                user_answer = await transcribe_voice(tmp.name)
+                os.unlink(tmp.name)
+            is_transcribed = True
+            await update.message.reply_text(
+                f"📝 *I heard:*\n_{user_answer}_\n\n⏳ Analyzing...",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Transcription error: {e}")
+            await update.message.reply_text(
+                "❌ Couldn't process your voice message. Please try again or type your answer."
+            )
+            return
+    else:
+        user_answer = update.message.text
 
     # No active task
-    task_id = user.get("current_task_id")
     if not task_id:
         completed = user.get("tasks_completed_today", 0)
         if completed >= 2:
@@ -345,11 +412,11 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Something went wrong. Use /task to try again.")
         return
 
-    user_answer = update.message.text
-    await update.message.reply_text("⏳ Reviewing your answer...")
+    if not is_transcribed:
+        await update.message.reply_text("⏳ Reviewing your answer...")
 
     try:
-        feedback = get_ai_feedback(task["content"], user_answer, task["skill"])
+        feedback = get_ai_feedback(task["content"], user_answer, task["skill"], is_transcribed)
     except Exception as e:
         logger.error(f"AI feedback error: {e}")
         feedback = "Good effort! Keep practicing — consistency is what builds real progress."
